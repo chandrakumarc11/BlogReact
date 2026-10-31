@@ -144,14 +144,14 @@ pipeline {
 
                             echo 'Building backend Docker image'
 
-                            docker build \
+                            docker build --pull \
                               -t '${BACKEND_IMAGE}:${BUILD_NUMBER}' \
                               -t '${BACKEND_IMAGE}:latest' \
                               ./backend
 
                             echo 'Building frontend Docker image'
 
-                            docker build \
+                            docker build --pull \
                               -t '${FRONTEND_IMAGE}:${BUILD_NUMBER}' \
                               -t '${FRONTEND_IMAGE}:latest' \
                               ./frontend
