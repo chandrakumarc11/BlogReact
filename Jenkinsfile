@@ -76,6 +76,13 @@ pipeline {
             }
         }
 
+	stage('SonarQube Quality Gate') {
+    steps {
+        timeout(time: 5, unit: 'MINUTES') {
+            waitForQualityGate abortPipeline: true
+        }
+    }
+}
         stage('Verify SSH Connection') {
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
