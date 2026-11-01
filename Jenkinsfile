@@ -391,7 +391,7 @@ pipeline {
     post {
         success {
             echo 'BlogReact deployment completed successfully'
-            echo 'Application: http://18.61.177.110:8080'
+            echo 'Application: http://40.192.68.43:8080'
         }
 
         failure {
