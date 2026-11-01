@@ -6,57 +6,184 @@ pipeline {
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '10'))
         skipDefaultCheckout(true)
+        timeout(time: 45, unit: 'MINUTES')
     }
 
     environment {
+        /*
+         * Application EC2
+         */
         APP_SERVER = '40.192.68.43'
         APP_USER = 'ubuntu'
         APP_DIR = '/home/ubuntu/BlogReact'
-
         SSH_CREDENTIAL_ID = 'app-ec2-ssh'
 
+        /*
+         * Git
+         */
         GIT_REPOSITORY = 'https://github.com/chandrakumarc11/BlogReact.git'
         GIT_BRANCH = 'main'
 
-        DOCKER_NETWORK = 'blog-network'
-
+        /*
+         * Local Docker image names
+         */
         BACKEND_IMAGE = 'blog-backend'
         FRONTEND_IMAGE = 'blog-frontend'
 
-        BACKEND_CONTAINER = 'blog-backend-test'
-        FRONTEND_CONTAINER = 'blog-frontend'
-
+        /*
+         * AWS and Amazon ECR
+         */
         AWS_REGION = 'ap-south-2'
         AWS_ACCOUNT_ID = '079960139717'
         ECR_REGISTRY = '079960139717.dkr.ecr.ap-south-2.amazonaws.com'
-
         ECR_BACKEND_REPO = 'blog-backend'
         ECR_FRONTEND_REPO = 'blog-frontend'
+
+        /*
+         * Amazon EKS
+         */
+        EKS_CLUSTER = 'blogreact-eks'
+        K8S_NAMESPACE = 'blogapp'
+        BACKEND_DEPLOYMENT = 'blog-backend'
+        FRONTEND_DEPLOYMENT = 'blog-frontend'
+        FRONTEND_SERVICE = 'blog-frontend-service'
     }
 
     stages {
-
         stage('Checkout') {
             steps {
                 checkout scm
 
                 sh '''
-                    set -e
+                    set -eu
 
-                    echo "Jenkins workspace:"
+                    echo "===== Jenkins Workspace ====="
                     pwd
 
-                    echo "Repository contents:"
+                    echo "===== Repository Contents ====="
                     ls -la
 
-                    echo "Validating project files:"
+                    echo "===== Validating Project Structure ====="
+
                     test -d frontend
                     test -d backend
+                    test -d k8s
+                    test -d eks
+
                     test -f frontend/Dockerfile
                     test -f backend/Dockerfile
+                    test -f frontend/nginx.conf
+
+                    test -f k8s/backend-deployment.yaml
+                    test -f k8s/backend-service.yaml
+                    test -f k8s/frontend-deployment.yaml
+                    test -f k8s/frontend-service.yaml
 
                     echo "Project structure validation successful"
                 '''
+            }
+        }
+
+        stage('Verify SSH Connection') {
+            steps {
+                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
+                    sh '''
+                        set -eu
+
+                        ssh \
+                          -o BatchMode=yes \
+                          -o StrictHostKeyChecking=no \
+                          -o ConnectTimeout=10 \
+                          "${APP_USER}@${APP_SERVER}" \
+                          "echo 'SSH connection successful'; hostname"
+                    '''
+                }
+            }
+        }
+
+        stage('Update Source on Application EC2') {
+            steps {
+                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
+                    sh '''
+                        set -eu
+
+                        ssh \
+                          -o StrictHostKeyChecking=no \
+                          "${APP_USER}@${APP_SERVER}" \
+                          "APP_DIR='${APP_DIR}' \
+                           GIT_REPOSITORY='${GIT_REPOSITORY}' \
+                           GIT_BRANCH='${GIT_BRANCH}' \
+                           bash -s" <<'REMOTE'
+                            set -eu
+
+                            if [ ! -d "${APP_DIR}/.git" ]; then
+                                echo "Repository not found. Cloning repository."
+
+                                git clone \
+                                  "${GIT_REPOSITORY}" \
+                                  "${APP_DIR}"
+                            fi
+
+                            cd "${APP_DIR}"
+
+                            echo "===== Fetching Latest Source ====="
+
+                            git fetch origin "${GIT_BRANCH}"
+                            git checkout "${GIT_BRANCH}"
+                            git reset --hard "origin/${GIT_BRANCH}"
+
+                            echo "===== Latest Commit ====="
+                            git log -1 --oneline
+
+                            echo "===== Validating Required Configuration ====="
+
+                            test -f backend/.env
+                            test -f frontend/Dockerfile
+                            test -f backend/Dockerfile
+                            test -f frontend/nginx.conf
+
+                            grep -q "blog-backend-service:5000" \
+                              frontend/nginx.conf
+
+                            echo "Application source update successful"
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        stage('Build and Test') {
+            steps {
+                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
+                    sh '''
+                        set -eu
+
+                        ssh \
+                          -o StrictHostKeyChecking=no \
+                          "${APP_USER}@${APP_SERVER}" \
+                          "APP_DIR='${APP_DIR}' bash -s" <<'REMOTE'
+                            set -eu
+
+                            cd "${APP_DIR}"
+
+                            echo "===== Backend Dependency and Test Validation ====="
+
+                            cd backend
+                            npm ci
+                            npm test --if-present
+                            node --check src/server.js
+
+                            echo "===== Frontend Build and Test Validation ====="
+
+                            cd ../frontend
+                            npm ci
+                            npm test --if-present
+                            npm run build
+
+                            echo "Build and test validation successful"
+REMOTE
+                    '''
+                }
             }
         }
 
@@ -67,9 +194,9 @@ pipeline {
 
                     withSonarQubeEnv('SonarQube') {
                         sh """
-                            set -e
+                            set -eu
 
-                            echo "Starting SonarQube analysis"
+                            echo "===== Starting SonarQube Analysis ====="
 
                             ${scannerHome}/bin/sonar-scanner \
                               -Dsonar.projectKey=BlogReact \
@@ -77,7 +204,7 @@ pipeline {
                               -Dsonar.sources=. \
                               -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/coverage/**
 
-                            echo "SonarQube analysis completed"
+                            echo "SonarQube analysis upload completed"
                         """
                     }
                 }
@@ -92,98 +219,50 @@ pipeline {
             }
         }
 
-        stage('Verify SSH Connection') {
-            steps {
-                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
-                    sh '''
-                        set -e
-
-                        ssh \
-                          -o BatchMode=yes \
-                          -o StrictHostKeyChecking=no \
-                          -o ConnectTimeout=10 \
-                          ${APP_USER}@${APP_SERVER} \
-                          "echo 'SSH connection successful'; hostname"
-                    '''
-                }
-            }
-        }
-
-        stage('Update Source on Application EC2') {
-            steps {
-                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
-                    sh '''
-                        ssh \
-                          -o StrictHostKeyChecking=no \
-                          ${APP_USER}@${APP_SERVER} "
-                            set -e
-
-                            if [ ! -d '${APP_DIR}/.git' ]; then
-                                echo 'Repository not found. Cloning repository.'
-
-                                git clone \
-                                  '${GIT_REPOSITORY}' \
-                                  '${APP_DIR}'
-                            fi
-
-                            cd '${APP_DIR}'
-
-                            echo 'Fetching latest source code'
-
-                            git fetch origin '${GIT_BRANCH}'
-                            git checkout '${GIT_BRANCH}'
-                            git reset --hard 'origin/${GIT_BRANCH}'
-
-                            echo 'Latest source code:'
-                            git log -1 --oneline
-
-                            echo 'Checking backend environment file'
-                            test -f backend/.env
-
-                            echo 'Application source update successful'
-                          "
-                    '''
-                }
-            }
-        }
-
         stage('Build Docker Images') {
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
                     sh '''
+                        set -eu
+
                         ssh \
                           -o StrictHostKeyChecking=no \
-                          ${APP_USER}@${APP_SERVER} "
-                            set -e
+                          "${APP_USER}@${APP_SERVER}" \
+                          "APP_DIR='${APP_DIR}' \
+                           BACKEND_IMAGE='${BACKEND_IMAGE}' \
+                           FRONTEND_IMAGE='${FRONTEND_IMAGE}' \
+                           BUILD_NUMBER='${BUILD_NUMBER}' \
+                           bash -s" <<'REMOTE'
+                            set -eu
 
-                            cd '${APP_DIR}'
+                            cd "${APP_DIR}"
 
-                            echo 'Building backend Docker image'
+                            echo "===== Building Backend Docker Image ====="
 
                             docker build --pull \
-                              -t '${BACKEND_IMAGE}:${BUILD_NUMBER}' \
-                              -t '${BACKEND_IMAGE}:latest' \
+                              -t "${BACKEND_IMAGE}:${BUILD_NUMBER}" \
+                              -t "${BACKEND_IMAGE}:latest" \
                               ./backend
 
-                            echo 'Building frontend Docker image'
+                            echo "===== Building Frontend Docker Image ====="
 
                             docker build --pull \
-                              -t '${FRONTEND_IMAGE}:${BUILD_NUMBER}' \
-                              -t '${FRONTEND_IMAGE}:latest' \
+                              -t "${FRONTEND_IMAGE}:${BUILD_NUMBER}" \
+                              -t "${FRONTEND_IMAGE}:latest" \
                               ./frontend
 
-                            echo 'Docker images built successfully'
+                            echo "===== Verifying Versioned Images ====="
 
                             docker image inspect \
-                              '${BACKEND_IMAGE}:${BUILD_NUMBER}' \
+                              "${BACKEND_IMAGE}:${BUILD_NUMBER}" \
                               >/dev/null
 
                             docker image inspect \
-                              '${FRONTEND_IMAGE}:${BUILD_NUMBER}' \
+                              "${FRONTEND_IMAGE}:${BUILD_NUMBER}" \
                               >/dev/null
 
-                            echo 'Versioned image verification successful'
-                          "
+                            echo "Docker image build completed successfully"
+REMOTE
                     '''
                 }
             }
@@ -193,16 +272,22 @@ pipeline {
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
                     sh '''
+                        set -eu
+
                         ssh \
                           -o StrictHostKeyChecking=no \
-                          ${APP_USER}@${APP_SERVER} "
-                            set -e
+                          "${APP_USER}@${APP_SERVER}" \
+                          "BACKEND_IMAGE='${BACKEND_IMAGE}' \
+                           FRONTEND_IMAGE='${FRONTEND_IMAGE}' \
+                           BUILD_NUMBER='${BUILD_NUMBER}' \
+                           bash -s" <<'REMOTE'
+                            set -eu
 
-                            echo 'Pulling Trivy Docker image'
+                            echo "===== Pulling Trivy Image ====="
 
                             docker pull aquasec/trivy:latest
 
-                            echo '===== Trivy Backend Image Scan ====='
+                            echo "===== Trivy Backend Scan ====="
 
                             docker run --rm \
                               -v /var/run/docker.sock:/var/run/docker.sock \
@@ -213,11 +298,11 @@ pipeline {
                               --severity HIGH,CRITICAL \
                               --ignore-unfixed \
                               --exit-code 1 \
-                              '${BACKEND_IMAGE}:${BUILD_NUMBER}'
+                              "${BACKEND_IMAGE}:${BUILD_NUMBER}"
 
-                            echo 'Backend image security scan passed'
+                            echo "Backend Trivy scan passed"
 
-                            echo '===== Trivy Frontend Image Scan ====='
+                            echo "===== Trivy Frontend Scan ====="
 
                             docker run --rm \
                               -v /var/run/docker.sock:/var/run/docker.sock \
@@ -228,11 +313,11 @@ pipeline {
                               --severity HIGH,CRITICAL \
                               --ignore-unfixed \
                               --exit-code 1 \
-                              '${FRONTEND_IMAGE}:${BUILD_NUMBER}'
+                              "${FRONTEND_IMAGE}:${BUILD_NUMBER}"
 
-                            echo 'Frontend image security scan passed'
-                            echo 'All Trivy scans completed successfully'
-                          "
+                            echo "Frontend Trivy scan passed"
+                            echo "All security scans completed successfully"
+REMOTE
                     '''
                 }
             }
@@ -242,252 +327,462 @@ pipeline {
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
                     sh '''
+                        set -eu
+
                         ssh \
                           -o StrictHostKeyChecking=no \
-                          ${APP_USER}@${APP_SERVER} "
-                            set -e
+                          "${APP_USER}@${APP_SERVER}" \
+                          "AWS_REGION='${AWS_REGION}' \
+                           AWS_ACCOUNT_ID='${AWS_ACCOUNT_ID}' \
+                           ECR_REGISTRY='${ECR_REGISTRY}' \
+                           ECR_BACKEND_REPO='${ECR_BACKEND_REPO}' \
+                           ECR_FRONTEND_REPO='${ECR_FRONTEND_REPO}' \
+                           BACKEND_IMAGE='${BACKEND_IMAGE}' \
+                           FRONTEND_IMAGE='${FRONTEND_IMAGE}' \
+                           BUILD_NUMBER='${BUILD_NUMBER}' \
+                           bash -s" <<'REMOTE'
+                            set -eu
 
-                            echo '===== Verifying AWS IAM Identity ====='
-
+                            echo "===== Verifying AWS IAM Identity ====="
                             aws sts get-caller-identity
 
-                            echo '===== Verifying ECR Repositories ====='
+                            echo "===== Verifying ECR Repositories ====="
 
                             aws ecr describe-repositories \
-                              --region '${AWS_REGION}' \
+                              --region "${AWS_REGION}" \
                               --repository-names \
-                                '${ECR_BACKEND_REPO}' \
-                                '${ECR_FRONTEND_REPO}' \
+                                "${ECR_BACKEND_REPO}" \
+                                "${ECR_FRONTEND_REPO}" \
                               >/dev/null
 
-                            echo '===== Amazon ECR Login ====='
+                            echo "===== Amazon ECR Login ====="
 
                             aws ecr get-login-password \
-                              --region '${AWS_REGION}' \
+                              --region "${AWS_REGION}" \
                             | docker login \
                               --username AWS \
-                              --password-stdin '${ECR_REGISTRY}'
+                              --password-stdin "${ECR_REGISTRY}"
 
-                            echo '===== Tagging Backend Image ====='
-
-                            docker tag \
-                              '${BACKEND_IMAGE}:${BUILD_NUMBER}' \
-                              '${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_NUMBER}'
-
-                            echo '===== Tagging Frontend Image ====='
+                            echo "===== Tagging Versioned Images ====="
 
                             docker tag \
-                              '${FRONTEND_IMAGE}:${BUILD_NUMBER}' \
-                              '${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_NUMBER}'
+                              "${BACKEND_IMAGE}:${BUILD_NUMBER}" \
+                              "${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_NUMBER}"
 
-                            echo '===== Pushing Backend Image ====='
+                            docker tag \
+                              "${FRONTEND_IMAGE}:${BUILD_NUMBER}" \
+                              "${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_NUMBER}"
+
+                            echo "===== Pushing Backend Image ====="
 
                             docker push \
-                              '${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_NUMBER}'
+                              "${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_NUMBER}"
 
-                            echo '===== Pushing Frontend Image ====='
+                            echo "===== Pushing Frontend Image ====="
 
                             docker push \
-                              '${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_NUMBER}'
+                              "${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_NUMBER}"
 
-                            echo '===== Verifying Backend Image in ECR ====='
-
-                            aws ecr describe-images \
-                              --repository-name '${ECR_BACKEND_REPO}' \
-                              --image-ids imageTag='${BUILD_NUMBER}' \
-                              --region '${AWS_REGION}' \
-                              >/dev/null
-
-                            echo '===== Verifying Frontend Image in ECR ====='
+                            echo "===== Verifying Backend Tag in ECR ====="
 
                             aws ecr describe-images \
-                              --repository-name '${ECR_FRONTEND_REPO}' \
-                              --image-ids imageTag='${BUILD_NUMBER}' \
-                              --region '${AWS_REGION}' \
+                              --repository-name "${ECR_BACKEND_REPO}" \
+                              --image-ids imageTag="${BUILD_NUMBER}" \
+                              --region "${AWS_REGION}" \
                               >/dev/null
 
-                            echo 'Amazon ECR image push and verification completed successfully'
-                          "
+                            echo "===== Verifying Frontend Tag in ECR ====="
+
+                            aws ecr describe-images \
+                              --repository-name "${ECR_FRONTEND_REPO}" \
+                              --image-ids imageTag="${BUILD_NUMBER}" \
+                              --region "${AWS_REGION}" \
+                              >/dev/null
+
+                            echo "ECR push and verification completed successfully"
+REMOTE
                     '''
                 }
             }
         }
 
-        stage('Deploy Backend') {
+        stage('Verify Amazon EKS Access') {
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
                     sh '''
+                        set -eu
+
                         ssh \
                           -o StrictHostKeyChecking=no \
-                          ${APP_USER}@${APP_SERVER} "
-                            set -e
+                          "${APP_USER}@${APP_SERVER}" \
+                          "AWS_REGION='${AWS_REGION}' \
+                           EKS_CLUSTER='${EKS_CLUSTER}' \
+                           K8S_NAMESPACE='${K8S_NAMESPACE}' \
+                           bash -s" <<'REMOTE'
+                            set -eu
 
-                            cd '${APP_DIR}'
+                            echo "===== Updating EKS kubeconfig ====="
 
-                            echo 'Checking Docker network'
+                            aws eks update-kubeconfig \
+                              --region "${AWS_REGION}" \
+                              --name "${EKS_CLUSTER}"
 
-                            docker network inspect '${DOCKER_NETWORK}' \
-                              >/dev/null 2>&1 \
-                              || docker network create '${DOCKER_NETWORK}'
+                            echo "===== Verifying EKS Nodes ====="
+                            kubectl get nodes
 
-                            echo 'Removing previous backend container'
+                            echo "===== Verifying Existing Deployments ====="
+                            kubectl get deployments \
+                              -n "${K8S_NAMESPACE}"
 
-                            docker rm -f '${BACKEND_CONTAINER}' \
-                              >/dev/null 2>&1 || true
-
-                            echo 'Starting backend container'
-
-                            docker run -d \
-                              --name '${BACKEND_CONTAINER}' \
-                              --restart unless-stopped \
-                              --network '${DOCKER_NETWORK}' \
-                              --env-file backend/.env \
-                              -p 5000:5000 \
-                              '${BACKEND_IMAGE}:${BUILD_NUMBER}'
-
-                            echo 'Backend container started'
-                          "
+                            echo "Amazon EKS access verification successful"
+REMOTE
                     '''
                 }
             }
         }
 
-        stage('Backend Health Check') {
+        stage('Deploy Backend to Amazon EKS') {
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
                     sh '''
+                        set -eu
+
                         ssh \
                           -o StrictHostKeyChecking=no \
-                          ${APP_USER}@${APP_SERVER} "
-                            set -e
+                          "${APP_USER}@${APP_SERVER}" \
+                          "ECR_REGISTRY='${ECR_REGISTRY}' \
+                           ECR_BACKEND_REPO='${ECR_BACKEND_REPO}' \
+                           BACKEND_DEPLOYMENT='${BACKEND_DEPLOYMENT}' \
+                           K8S_NAMESPACE='${K8S_NAMESPACE}' \
+                           BUILD_NUMBER='${BUILD_NUMBER}' \
+                           bash -s" <<'REMOTE'
+                            set -eu
+
+                            BACKEND_TARGET_IMAGE="${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_NUMBER}"
+
+                            echo "===== Deploying Backend Image ====="
+                            echo "Backend image: ${BACKEND_TARGET_IMAGE}"
+
+                            kubectl set image \
+                              "deployment/${BACKEND_DEPLOYMENT}" \
+                              "backend=${BACKEND_TARGET_IMAGE}" \
+                              -n "${K8S_NAMESPACE}"
+
+                            echo "===== Waiting for Backend Rolling Update ====="
+
+                            if ! kubectl rollout status \
+                              "deployment/${BACKEND_DEPLOYMENT}" \
+                              -n "${K8S_NAMESPACE}" \
+                              --timeout=180s; then
+
+                                echo "Backend rollout failed"
+                                echo "===== Backend Pods ====="
+
+                                kubectl get pods \
+                                  -n "${K8S_NAMESPACE}" \
+                                  -l app=blog-backend \
+                                  -o wide || true
+
+                                echo "===== Backend Deployment Description ====="
+
+                                kubectl describe \
+                                  "deployment/${BACKEND_DEPLOYMENT}" \
+                                  -n "${K8S_NAMESPACE}" || true
+
+                                echo "===== Backend Recent Logs ====="
+
+                                kubectl logs \
+                                  "deployment/${BACKEND_DEPLOYMENT}" \
+                                  -n "${K8S_NAMESPACE}" \
+                                  --tail=100 || true
+
+                                exit 1
+                            fi
+
+                            echo "Backend rolling deployment completed successfully"
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Backend Deployment') {
+            steps {
+                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
+                    sh '''
+                        set -eu
+
+                        ssh \
+                          -o StrictHostKeyChecking=no \
+                          "${APP_USER}@${APP_SERVER}" \
+                          "K8S_NAMESPACE='${K8S_NAMESPACE}' bash -s" <<'REMOTE'
+                            set -eu
+
+                            echo "===== Backend Deployment Status ====="
+
+                            kubectl get deployment blog-backend \
+                              -n "${K8S_NAMESPACE}"
+
+                            echo "===== Backend Pods ====="
+
+                            kubectl get pods \
+                              -n "${K8S_NAMESPACE}" \
+                              -l app=blog-backend \
+                              -o wide
+
+                            echo "===== Backend Internal API Test ====="
+
+                            kubectl run "backend-test-${RANDOM}" \
+                              --rm \
+                              -i \
+                              --restart=Never \
+                              --image=curlimages/curl \
+                              -n "${K8S_NAMESPACE}" \
+                              -- \
+                              curl \
+                                --fail \
+                                --silent \
+                                --show-error \
+                                --max-time 30 \
+                                http://blog-backend-service:5000/api/posts \
+                              >/dev/null
+
+                            echo "Backend service and RDS validation successful"
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Frontend to Amazon EKS') {
+            steps {
+                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
+                    sh '''
+                        set -eu
+
+                        ssh \
+                          -o StrictHostKeyChecking=no \
+                          "${APP_USER}@${APP_SERVER}" \
+                          "ECR_REGISTRY='${ECR_REGISTRY}' \
+                           ECR_FRONTEND_REPO='${ECR_FRONTEND_REPO}' \
+                           FRONTEND_DEPLOYMENT='${FRONTEND_DEPLOYMENT}' \
+                           K8S_NAMESPACE='${K8S_NAMESPACE}' \
+                           BUILD_NUMBER='${BUILD_NUMBER}' \
+                           bash -s" <<'REMOTE'
+                            set -eu
+
+                            FRONTEND_TARGET_IMAGE="${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_NUMBER}"
+
+                            echo "===== Deploying Frontend Image ====="
+                            echo "Frontend image: ${FRONTEND_TARGET_IMAGE}"
+
+                            kubectl set image \
+                              "deployment/${FRONTEND_DEPLOYMENT}" \
+                              "frontend=${FRONTEND_TARGET_IMAGE}" \
+                              -n "${K8S_NAMESPACE}"
+
+                            echo "===== Waiting for Frontend Rolling Update ====="
+
+                            if ! kubectl rollout status \
+                              "deployment/${FRONTEND_DEPLOYMENT}" \
+                              -n "${K8S_NAMESPACE}" \
+                              --timeout=180s; then
+
+                                echo "Frontend rollout failed"
+                                echo "===== Frontend Pods ====="
+
+                                kubectl get pods \
+                                  -n "${K8S_NAMESPACE}" \
+                                  -l app=blog-frontend \
+                                  -o wide || true
+
+                                echo "===== Frontend Deployment Description ====="
+
+                                kubectl describe \
+                                  "deployment/${FRONTEND_DEPLOYMENT}" \
+                                  -n "${K8S_NAMESPACE}" || true
+
+                                echo "===== Frontend Recent Logs ====="
+
+                                kubectl logs \
+                                  "deployment/${FRONTEND_DEPLOYMENT}" \
+                                  -n "${K8S_NAMESPACE}" \
+                                  --tail=100 || true
+
+                                exit 1
+                            fi
+
+                            echo "Frontend rolling deployment completed successfully"
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        stage('Validate EKS Application') {
+            steps {
+                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
+                    sh '''
+                        set -eu
+
+                        ssh \
+                          -o StrictHostKeyChecking=no \
+                          "${APP_USER}@${APP_SERVER}" \
+                          "K8S_NAMESPACE='${K8S_NAMESPACE}' \
+                           FRONTEND_SERVICE='${FRONTEND_SERVICE}' \
+                           BACKEND_DEPLOYMENT='${BACKEND_DEPLOYMENT}' \
+                           FRONTEND_DEPLOYMENT='${FRONTEND_DEPLOYMENT}' \
+                           BUILD_NUMBER='${BUILD_NUMBER}' \
+                           bash -s" <<'REMOTE'
+                            set -eu
+
+                            echo "===== Final Kubernetes Resources ====="
+
+                            kubectl get deployments \
+                              -n "${K8S_NAMESPACE}"
+
+                            kubectl get pods \
+                              -n "${K8S_NAMESPACE}" \
+                              -o wide
+
+                            kubectl get services \
+                              -n "${K8S_NAMESPACE}"
+
+                            echo "===== Verifying Deployment Images ====="
+
+                            BACKEND_RUNNING_IMAGE=$(
+                              kubectl get \
+                                "deployment/${BACKEND_DEPLOYMENT}" \
+                                -n "${K8S_NAMESPACE}" \
+                                -o jsonpath='{.spec.template.spec.containers[0].image}'
+                            )
+
+                            FRONTEND_RUNNING_IMAGE=$(
+                              kubectl get \
+                                "deployment/${FRONTEND_DEPLOYMENT}" \
+                                -n "${K8S_NAMESPACE}" \
+                                -o jsonpath='{.spec.template.spec.containers[0].image}'
+                            )
+
+                            echo "Backend running image: ${BACKEND_RUNNING_IMAGE}"
+                            echo "Frontend running image: ${FRONTEND_RUNNING_IMAGE}"
+
+                            echo "${BACKEND_RUNNING_IMAGE}" \
+                              | grep -q ":${BUILD_NUMBER}$"
+
+                            echo "${FRONTEND_RUNNING_IMAGE}" \
+                              | grep -q ":${BUILD_NUMBER}$"
+
+                            echo "===== Resolving LoadBalancer Hostname ====="
 
                             ATTEMPT=1
+                            LB_HOST=""
 
-                            while [ \\$ATTEMPT -le 12 ]; do
-                                if curl -fsS http://localhost:5000/healthz; then
-                                    echo
-                                    echo 'Backend health check successful'
+                            while [ "${ATTEMPT}" -le 18 ]; do
+                                LB_HOST=$(
+                                  kubectl get service \
+                                    "${FRONTEND_SERVICE}" \
+                                    -n "${K8S_NAMESPACE}" \
+                                    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+                                )
 
-                                    docker ps \
-                                      --filter name='${BACKEND_CONTAINER}'
-
-                                    exit 0
+                                if [ -n "${LB_HOST}" ]; then
+                                    break
                                 fi
 
-                                echo \"Waiting for backend: attempt \\$ATTEMPT of 12\"
+                                echo "Waiting for LoadBalancer hostname: attempt ${ATTEMPT} of 18"
 
-                                ATTEMPT=\\$((ATTEMPT + 1))
-                                sleep 5
+                                ATTEMPT=$((ATTEMPT + 1))
+                                sleep 10
                             done
 
-                            echo 'Backend health check failed'
+                            test -n "${LB_HOST}"
 
-                            echo 'Backend container status:'
+                            echo "Application LoadBalancer: http://${LB_HOST}"
 
-                            docker ps -a \
-                              --filter name='${BACKEND_CONTAINER}'
-
-                            echo 'Backend container logs:'
-
-                            docker logs \
-                              --tail 100 \
-                              '${BACKEND_CONTAINER}' || true
-
-                            exit 1
-                          "
-                    '''
-                }
-            }
-        }
-
-        stage('Deploy Frontend') {
-            steps {
-                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
-                    sh '''
-                        ssh \
-                          -o StrictHostKeyChecking=no \
-                          ${APP_USER}@${APP_SERVER} "
-                            set -e
-
-                            echo 'Removing previous frontend container'
-
-                            docker rm -f '${FRONTEND_CONTAINER}' \
-                              >/dev/null 2>&1 || true
-
-                            echo 'Starting frontend container'
-
-                            docker run -d \
-                              --name '${FRONTEND_CONTAINER}' \
-                              --restart unless-stopped \
-                              --network '${DOCKER_NETWORK}' \
-                              -p 8080:80 \
-                              '${FRONTEND_IMAGE}:${BUILD_NUMBER}'
-
-                            echo 'Frontend container started'
-                          "
-                    '''
-                }
-            }
-        }
-
-        stage('Application Verification') {
-            steps {
-                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
-                    sh '''
-                        ssh \
-                          -o StrictHostKeyChecking=no \
-                          ${APP_USER}@${APP_SERVER} "
-                            set -e
+                            echo "===== External Application Validation ====="
 
                             ATTEMPT=1
 
-                            while [ \\$ATTEMPT -le 12 ]; do
-                                if curl -fsS \
-                                  http://localhost:8080/api/posts \
+                            while [ "${ATTEMPT}" -le 18 ]; do
+                                if curl \
+                                  --fail \
+                                  --silent \
+                                  --show-error \
+                                  --max-time 30 \
+                                  "http://${LB_HOST}/" \
+                                  >/dev/null \
+                                && curl \
+                                  --fail \
+                                  --silent \
+                                  --show-error \
+                                  --max-time 30 \
+                                  "http://${LB_HOST}/api/posts" \
                                   >/dev/null; then
 
-                                    echo 'Frontend and API verification successful'
-
-                                    echo 'Running application containers:'
-
-                                    docker ps \
-                                      --filter name=blog-
+                                    echo "External frontend validation successful"
+                                    echo "External backend and RDS validation successful"
+                                    echo "Application URL: http://${LB_HOST}"
 
                                     exit 0
                                 fi
 
-                                echo \"Waiting for application: attempt \\$ATTEMPT of 12\"
+                                echo "Waiting for EKS application: attempt ${ATTEMPT} of 18"
 
-                                ATTEMPT=\\$((ATTEMPT + 1))
-                                sleep 5
+                                ATTEMPT=$((ATTEMPT + 1))
+                                sleep 10
                             done
 
-                            echo 'Application verification failed'
+                            echo "EKS application validation failed"
 
-                            echo 'Frontend container status:'
+                            echo "===== Frontend Logs ====="
 
-                            docker ps -a \
-                              --filter name='${FRONTEND_CONTAINER}'
+                            kubectl logs \
+                              "deployment/${FRONTEND_DEPLOYMENT}" \
+                              -n "${K8S_NAMESPACE}" \
+                              --tail=100 || true
 
-                            echo 'Frontend logs:'
+                            echo "===== Backend Logs ====="
 
-                            docker logs \
-                              --tail 100 \
-                              '${FRONTEND_CONTAINER}' || true
+                            kubectl logs \
+                              "deployment/${BACKEND_DEPLOYMENT}" \
+                              -n "${K8S_NAMESPACE}" \
+                              --tail=100 || true
 
-                            echo 'Backend container status:'
+                            echo "===== Recent Namespace Events ====="
 
-                            docker ps -a \
-                              --filter name='${BACKEND_CONTAINER}'
-
-                            echo 'Backend logs:'
-
-                            docker logs \
-                              --tail 100 \
-                              '${BACKEND_CONTAINER}' || true
+                            kubectl get events \
+                              -n "${K8S_NAMESPACE}" \
+                              --sort-by=.lastTimestamp || true
 
                             exit 1
-                          "
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        stage('Cleanup Old Docker Images') {
+            steps {
+                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
+                    sh '''
+                        set -eu
+
+                        ssh \
+                          -o StrictHostKeyChecking=no \
+                          "${APP_USER}@${APP_SERVER}" \
+                          "bash -s" <<'REMOTE'
+                            set -eu
+
+                            echo "===== Docker Disk Usage Before Cleanup ====="
+                            docker system df || true
+
+                            echo "===== Removing Dangling Images ====="
+                            docker image prune -f || true
+
+                            echo "===== Docker Disk Usage After Cleanup ====="
+                            docker system df || true
+REMOTE
                     '''
                 }
             }
@@ -496,15 +791,17 @@ pipeline {
 
     post {
         success {
-            echo 'BlogReact deployment completed successfully'
-            echo "Application: http://${APP_SERVER}:8080"
+            echo 'BlogReact CI/CD deployment to Amazon EKS completed successfully'
             echo "Backend ECR image: ${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_NUMBER}"
             echo "Frontend ECR image: ${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_NUMBER}"
+            echo "EKS cluster: ${EKS_CLUSTER}"
+            echo "Kubernetes namespace: ${K8S_NAMESPACE}"
         }
 
         failure {
-            echo 'BlogReact deployment failed.'
-            echo 'Check the failed stage and Jenkins Console Output.'
+            echo 'BlogReact CI/CD deployment failed'
+            echo 'Check the failed Jenkins stage and Console Output'
+            echo 'The previous healthy Kubernetes ReplicaSet should remain available when the rolling update cannot become ready'
         }
 
         always {
