@@ -5,6 +5,7 @@ pipeline {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '10'))
+        skipDefaultCheckout(true)
     }
 
     environment {
@@ -24,6 +25,13 @@ pipeline {
 
         BACKEND_CONTAINER = 'blog-backend-test'
         FRONTEND_CONTAINER = 'blog-frontend'
+
+        AWS_REGION = 'ap-south-2'
+        AWS_ACCOUNT_ID = '079960139717'
+        ECR_REGISTRY = '079960139717.dkr.ecr.ap-south-2.amazonaws.com'
+
+        ECR_BACKEND_REPO = 'blog-backend'
+        ECR_FRONTEND_REPO = 'blog-frontend'
     }
 
     stages {
@@ -76,13 +84,14 @@ pipeline {
             }
         }
 
-	stage('SonarQube Quality Gate') {
-    steps {
-        timeout(time: 5, unit: 'MINUTES') {
-            waitForQualityGate abortPipeline: true
+        stage('SonarQube Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
         }
-    }
-}
+
         stage('Verify SSH Connection') {
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
@@ -165,9 +174,15 @@ pipeline {
 
                             echo 'Docker images built successfully'
 
-                            docker images \
-                              --format '{{.Repository}}:{{.Tag}}' \
-                              | grep -E 'blog-backend|blog-frontend'
+                            docker image inspect \
+                              '${BACKEND_IMAGE}:${BUILD_NUMBER}' \
+                              >/dev/null
+
+                            docker image inspect \
+                              '${FRONTEND_IMAGE}:${BUILD_NUMBER}' \
+                              >/dev/null
+
+                            echo 'Versioned image verification successful'
                           "
                     '''
                 }
@@ -217,6 +232,81 @@ pipeline {
 
                             echo 'Frontend image security scan passed'
                             echo 'All Trivy scans completed successfully'
+                          "
+                    '''
+                }
+            }
+        }
+
+        stage('Push Images to Amazon ECR') {
+            steps {
+                sshagent(credentials: ["${SSH_CREDENTIAL_ID}"]) {
+                    sh '''
+                        ssh \
+                          -o StrictHostKeyChecking=no \
+                          ${APP_USER}@${APP_SERVER} "
+                            set -e
+
+                            echo '===== Verifying AWS IAM Identity ====='
+
+                            aws sts get-caller-identity
+
+                            echo '===== Verifying ECR Repositories ====='
+
+                            aws ecr describe-repositories \
+                              --region '${AWS_REGION}' \
+                              --repository-names \
+                                '${ECR_BACKEND_REPO}' \
+                                '${ECR_FRONTEND_REPO}' \
+                              >/dev/null
+
+                            echo '===== Amazon ECR Login ====='
+
+                            aws ecr get-login-password \
+                              --region '${AWS_REGION}' \
+                            | docker login \
+                              --username AWS \
+                              --password-stdin '${ECR_REGISTRY}'
+
+                            echo '===== Tagging Backend Image ====='
+
+                            docker tag \
+                              '${BACKEND_IMAGE}:${BUILD_NUMBER}' \
+                              '${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_NUMBER}'
+
+                            echo '===== Tagging Frontend Image ====='
+
+                            docker tag \
+                              '${FRONTEND_IMAGE}:${BUILD_NUMBER}' \
+                              '${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_NUMBER}'
+
+                            echo '===== Pushing Backend Image ====='
+
+                            docker push \
+                              '${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_NUMBER}'
+
+                            echo '===== Pushing Frontend Image ====='
+
+                            docker push \
+                              '${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_NUMBER}'
+
+                            echo '===== Verifying Backend Image in ECR ====='
+
+                            aws ecr describe-images \
+                              --repository-name '${ECR_BACKEND_REPO}' \
+                              --image-ids imageTag='${BUILD_NUMBER}' \
+                              --region '${AWS_REGION}' \
+                              >/dev/null
+
+                            echo '===== Verifying Frontend Image in ECR ====='
+
+                            aws ecr describe-images \
+                              --repository-name '${ECR_FRONTEND_REPO}' \
+                              --image-ids imageTag='${BUILD_NUMBER}' \
+                              --region '${AWS_REGION}' \
+                              >/dev/null
+
+                            echo 'Amazon ECR image push and verification completed successfully'
                           "
                     '''
                 }
@@ -277,8 +367,10 @@ pipeline {
                                 if curl -fsS http://localhost:5000/healthz; then
                                     echo
                                     echo 'Backend health check successful'
+
                                     docker ps \
                                       --filter name='${BACKEND_CONTAINER}'
+
                                     exit 0
                                 fi
 
@@ -291,10 +383,12 @@ pipeline {
                             echo 'Backend health check failed'
 
                             echo 'Backend container status:'
+
                             docker ps -a \
                               --filter name='${BACKEND_CONTAINER}'
 
                             echo 'Backend container logs:'
+
                             docker logs \
                               --tail 100 \
                               '${BACKEND_CONTAINER}' || true
@@ -355,6 +449,7 @@ pipeline {
                                     echo 'Frontend and API verification successful'
 
                                     echo 'Running application containers:'
+
                                     docker ps \
                                       --filter name=blog-
 
@@ -370,19 +465,23 @@ pipeline {
                             echo 'Application verification failed'
 
                             echo 'Frontend container status:'
+
                             docker ps -a \
                               --filter name='${FRONTEND_CONTAINER}'
 
                             echo 'Frontend logs:'
+
                             docker logs \
                               --tail 100 \
                               '${FRONTEND_CONTAINER}' || true
 
                             echo 'Backend container status:'
+
                             docker ps -a \
                               --filter name='${BACKEND_CONTAINER}'
 
                             echo 'Backend logs:'
+
                             docker logs \
                               --tail 100 \
                               '${BACKEND_CONTAINER}' || true
@@ -398,7 +497,9 @@ pipeline {
     post {
         success {
             echo 'BlogReact deployment completed successfully'
-            echo 'Application: http://40.192.68.43:8080'
+            echo "Application: http://${APP_SERVER}:8080"
+            echo "Backend ECR image: ${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_NUMBER}"
+            echo "Frontend ECR image: ${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_NUMBER}"
         }
 
         failure {
