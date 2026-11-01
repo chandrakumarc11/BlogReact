@@ -8,7 +8,7 @@ pipeline {
     }
 
     environment {
-        APP_SERVER = '18.61.177.110'
+        APP_SERVER = '40.192.68.43'
         APP_USER = 'ubuntu'
         APP_DIR = '/home/ubuntu/BlogReact'
 
